@@ -153,51 +153,101 @@ class DoomGameEnvironment(gym.Env):
         
         hsv = cv2.cvtColor(health_area, cv2.COLOR_RGB2HSV)
         
-        mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
-        mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
+        mask1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
         red_mask = mask1 + mask2
         
         kernel_open = np.ones((2, 2), np.uint8)
         cleaned_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel_open)
         kernel_close = np.ones((3, 3), np.uint8)
         cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel_close)
-        
-        # Находим контуры, как и раньше
         contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         heart_contours = []
-        
-        # --- УЛУЧШЕННАЯ ЛОГИКА ФИЛЬТРАЦИИ ---
-        min_heart_area = 60  # Немного снижаем минимальный порог
-        max_heart_area = 500 # Добавляем максимальный порог на всякий случай
+        min_heart_area = 100
+        max_heart_area = 200
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            
-            # 1. Фильтруем по диапазону площадей
             if min_heart_area < area < max_heart_area:
-                # 2. Добавляем проверку на форму (соотношение сторон)
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = float(w) / h
-                
-                # Сердца должны быть примерно квадратной формы
-                if 0.7 < aspect_ratio < 1.3:
-                    heart_contours.append(contour)
+                heart_contours.append(contour)
         
         total_hearts = len(heart_contours)
-        max_hearts = 10  # Предполагаемое максимальное количество сердец
+        max_hearts = 10
         
         health_percentage = int((total_hearts / max_hearts) * 100)
         
         return  min(100, max(0, health_percentage))
     
-    # Метод для обнаружения врагов на основе движения между кадрами
-    def detect_enemies(self, screenshot):
-        return null
-    
     # Метод для определения количества предметов в инвентаре
     def detect_items(self, screenshot):
-        return null
+        """
+        Детекция предметов по белой обводке
+        """
+
+        height, width = screenshot.shape[:2]
+        search_area = screenshot[int(height*0.07):int(height*0.14), int(width*0.3):int(width*0.7)]
+        if search_area.size == 0:
+            return 0
+        
+        hsv = cv2.cvtColor(search_area, cv2.COLOR_RGB2HSV)
+        
+        white_lower, white_upper = (np.array([0, 0, 180]), np.array([180, 30, 255]))
+        mask = cv2.inRange(hsv, white_lower, white_upper)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned_mask, connectivity=8)
+        valid_items = []
+        h, w = cleaned_mask.shape
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+            width_comp, height_comp = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            
+            if (area >= 5 and 
+                2 < x < w-2 and 2 < y < h-2 and 
+                x + width_comp < w-2 and y + height_comp < h-2 and
+                20 < width_comp < 120 and 20 < height_comp < 120):
+                
+                valid_items.append({
+                    'centroid': centroids[i]
+                })
+        
+        grouped_items = self._simple_grouping(valid_items)
+        
+        return min(len(grouped_items), 20)
+    
+    def _simple_grouping(self, items):
+        """Упрощенная группировка близких элементов"""
+        if not items:
+            return []
+        
+        groups = []
+        used = [False] * len(items)
+        merge_distance = 30
+        
+        for i, item in enumerate(items):
+            if used[i]:
+                continue
+                
+            group = [item]
+            used[i] = True
+            cx1, cy1 = item['centroid']
+            
+            for j in range(i + 1, len(items)):
+                if used[j]:
+                    continue
+                    
+                cx2, cy2 = items[j]['centroid']
+                if np.sqrt((cx1 - cx2)**2 + (cy1 - cy2)**2) <= merge_distance:
+                    group.append(items[j])
+                    used[j] = True
+            
+            groups.append(group)
+        
+        return groups
     
     # Метод для выполнения игровых действий
     def execute_action(self, action):

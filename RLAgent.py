@@ -9,9 +9,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from mss import mss
-import random
-import matplotlib.pyplot as plt
-import tkinter as tk
+import os
 
 pyautogui.FAILSAFE = False
 
@@ -127,6 +125,7 @@ class DoomGameEnvironment(gym.Env):
             with mss() as sct:
                 screenshot = sct.grab(self.game_region)
                 img = np.array(screenshot)[:, :, :3]  
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
                 return img
         except Exception as e:
             return np.zeros((self.game_region['height'], self.game_region['width'], 3), dtype=np.uint8)
@@ -148,8 +147,18 @@ class DoomGameEnvironment(gym.Env):
         return resized
     
     def detect_health(self, screenshot):
+        """
+        Детекция здоровья. Возвращает словарь с отладочной информацией.
+        """
         height, width = screenshot.shape[:2]
-        health_area = screenshot[int(height * 0.85):, int(width * 0.3):int(width * 0.7)]
+        
+        # Координаты области поиска здоровья
+        y_start = int(height * 0.85)
+        x_start = int(width * 0.3)
+        x_end = int(width * 0.7)
+        health_area_coords = (x_start, y_start, x_end - x_start, height - y_start)
+        
+        health_area = screenshot[y_start:, x_start:x_end]
         
         hsv = cv2.cvtColor(health_area, cv2.COLOR_RGB2HSV)
         
@@ -164,43 +173,53 @@ class DoomGameEnvironment(gym.Env):
         contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         heart_contours = []
-        min_heart_area = 100
-        max_heart_area = 200
+        min_heart_area = 1000
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if min_heart_area < area < max_heart_area:
+            if min_heart_area < area:
                 heart_contours.append(contour)
         
         total_hearts = len(heart_contours)
         max_hearts = 10
-        
         health_percentage = int((total_hearts / max_hearts) * 100)
         
-        return  min(100, max(0, health_percentage))
+        return {
+            "value": min(100, max(0, health_percentage)),
+            "search_area_coords": health_area_coords,
+            "found_contours": heart_contours
+        }
     
     # Метод для определения количества предметов в инвентаре
     def detect_items(self, screenshot):
         """
-        Детекция предметов по белой обводке
+        Детекция предметов. Возвращает словарь с отладочной информацией.
         """
-
         height, width = screenshot.shape[:2]
-        search_area = screenshot[int(height*0.07):int(height*0.14), int(width*0.3):int(width*0.7)]
+        
+        # Координаты области поиска предметов
+        y_start = int(height * 0.07)
+        y_end = int(height * 0.14)
+        x_start = int(width * 0.3)
+        x_end = int(width * 0.7)
+        items_area_coords = (x_start, y_start, x_end - x_start, y_end - y_start)
+        
+        search_area = screenshot[y_start:y_end, x_start:x_end]
+        
         if search_area.size == 0:
-            return 0
+            return {"value": 0, "search_area_coords": items_area_coords, "found_boxes": []}
         
+        search_area = cv2.cvtColor(search_area, cv2.COLOR_RGB2BGR)
         hsv = cv2.cvtColor(search_area, cv2.COLOR_RGB2HSV)
-        
         white_lower, white_upper = (np.array([0, 0, 180]), np.array([180, 30, 255]))
         mask = cv2.inRange(hsv, white_lower, white_upper)
         
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
         cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned_mask, connectivity=8)
+        
         valid_items = []
         h, w = cleaned_mask.shape
-        
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
             x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
@@ -209,15 +228,27 @@ class DoomGameEnvironment(gym.Env):
             if (area >= 5 and 
                 2 < x < w-2 and 2 < y < h-2 and 
                 x + width_comp < w-2 and y + height_comp < h-2 and
-                20 < width_comp < 120 and 20 < height_comp < 120):
+                20 < width_comp < 130 and 20 < height_comp < 130):
                 
                 valid_items.append({
-                    'centroid': centroids[i]
+                    'centroid': centroids[i],
+                    'box': (x, y, width_comp, height_comp)
                 })
-        
+                
         grouped_items = self._simple_grouping(valid_items)
         
-        return min(len(grouped_items), 20)
+        # Получаем рамки для каждой группы
+        found_boxes = []
+        for group in grouped_items:
+            if group:
+                # Просто берем рамку первого элемента в группе для простоты
+                found_boxes.append(group[0]['box'])
+
+        return {
+            "value": min(len(grouped_items), 20),
+            "search_area_coords": items_area_coords,
+            "found_boxes": found_boxes
+        }
     
     def _simple_grouping(self, items):
         """Упрощенная группировка близких элементов"""
@@ -314,6 +345,13 @@ class DoomGameEnvironment(gym.Env):
             reward += health_change * 0.3
         
         self.previous_health = current_health
+
+        current_items = self.detect_items(screenshot)
+        
+        if current_items > self.previous_items:
+            reward += (current_items - self.previous_items) * 10.0
+        
+        self.previous_items = current_items
         
         if current_health > 0:
             reward += 1.0
@@ -368,8 +406,107 @@ class DoomGameEnvironment(gym.Env):
         }
         
         return observation, reward, terminated, truncated, info
-    
 
+def show_detection_debug():
+    """Отладка системы распознавания с визуализацией и сохранением."""
+    
+    debug_folder = "debug_screenshots"
+    os.makedirs(debug_folder, exist_ok=True)
+    print(f"Скриншоты будут сохраняться в папку: '{debug_folder}'")
+    
+    debug_env = DoomGameEnvironment()
+    
+    print("\nЗапустите игру и переключитесь на нее.")
+    print("Нажмите Enter в этой консоли, чтобы начать мониторинг...")
+    input()
+    
+    print("Начинаем мониторинг (нажмите Ctrl+C для остановки)...")
+    
+    try:
+        while True:
+            original_screenshot = debug_env.capture_screen()
+            if original_screenshot is None or original_screenshot.size == 0:
+                print("Не удалось получить скриншот.")
+                time.sleep(1)
+                continue
+            
+            debug_image = original_screenshot.copy()
+
+            # 1. Анализируем ЗДОРОВЬЕ
+            health_data = debug_env.detect_health(original_screenshot)
+            health_value = health_data['value']
+            
+            hx, hy, hw, hh = health_data['search_area_coords']
+            cv2.rectangle(debug_image, (hx, hy), (hx + hw, hy + hh), (0, 255, 0), 2)
+            cv2.putText(debug_image, 'HP', (hx, hy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            for contour in health_data['found_contours']:
+                contour[:, :, 0] += hx
+                contour[:, :, 1] += hy
+                cv2.drawContours(debug_image, [contour], -1, (0, 0, 255), 2)
+
+            # 2. Анализируем ПРЕДМЕТЫ
+            items_data = debug_env.detect_items(original_screenshot)
+            items_count = items_data['value']
+
+            ix, iy, iw, ih = items_data['search_area_coords']
+            cv2.rectangle(debug_image, (ix, iy), (ix + iw, iy + ih), (255, 0, 0), 2)
+            cv2.putText(debug_image, 'Items', (ix, iy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+            for box in items_data['found_boxes']:
+                x, y, w, h = box
+                global_x, global_y = x + ix, y + iy
+                cv2.rectangle(debug_image, (global_x, global_y), (global_x + w, global_y + h), (255, 255, 0), 2)
+            
+            timestamp = time.strftime('%H:%M:%S')
+            print(f"[{timestamp}] Здоровье: {health_value}%, Предметы: {items_count}")
+            
+            filename = f"debug_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            filepath = os.path.join(debug_folder, filename)
+            cv2.imwrite(filepath, debug_image)
+            
+            time.sleep(5)
+            
+    except KeyboardInterrupt:
+        print("\n Отладка завершена")
+
+def main_menu():
+    """Главное меню программы"""
+    
+    print("\nДоступные функции:")
+    print("1. Отладка распознавания элементов")
+    print("2. Запуск обучения RL-агента")
+    
+    while True:
+        try:
+            choice = input("\n Выберите действие 1: ").strip()
+
+                
+            if choice == "1":
+                print("\n" + "="*50)
+                show_detection_debug()
+                break
+
+            if choice == "2":
+                print("\n" + "="*50)
+                show_detection_debug()
+                break
+                
+            else:
+                print("Неверный выбор. Попробуйте еще раз.")
+                
+        except KeyboardInterrupt:
+            print("\n Программа прервана пользователем")
+            break
+        except Exception as e:
+            print(f"Неожиданная ошибка: {e}")
+            break
+
+
+# Точка входа в программу
 if __name__ == "__main__":
-    env = DoomGameEnvironment(monitor_index=0, capture_mode="fullscreen")
-    env.detect_health()
+    try:
+        main_menu()
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        print("Попробуйте перезапустить программу")
